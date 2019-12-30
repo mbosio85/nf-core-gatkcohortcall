@@ -99,8 +99,13 @@ params.onekgIndex     = params.genomes[params.genome].onekgIndex
 excess_het_threshold = 54.69
 
 // Store the chromosomes in a channel for easier workload scattering on large cohort
-chromosomes_ch = Channel
+if (params.genome == 'GRCh38'){
+    chromosomes_ch = Channel
     .from( "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "chrY" )
+}else{
+    chromosomes_ch = Channel
+    .from( "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "X", "Y" )
+}
 
 
 
@@ -249,7 +254,7 @@ process GenomicsDBImport {
 
     input:
 	each chr from chromosomes_ch
-    set file(gvcf), file(gvcf_idx) from inputSample.collect()
+    set file(gvcf), file(gvcf_idx) from inputSample
 
 	output:
     set chr, file ("${params.cohort}.${chr}") into gendb_ch
@@ -279,13 +284,15 @@ process GenotypeGVCFs {
 	
 	tag { chr }
 
-	publishDir params.output_dir, mode: 'copy', pattern: '*.{vcf,idx}'
+	publishDir params.outdir, mode: 'copy', pattern: '*.{vcf,idx}'
 
     input:
 	set chr, file (workspace) from gendb_ch
    	file genome from ch_fasta
     file genomefai from ch_fastaFai
     file genomedict from params.dict 
+    file dbsnp_resource_vcf from params.dbsnp
+    file dbsnp_resource_vcf_idx from params.dbsnpIndex
 
 	output:
     set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
@@ -487,7 +494,7 @@ process ApplyRecalibration {
 	
 	tag "${params.cohort}"
 
-	publishDir params.output_dir, mode: 'copy'
+	publishDir params.outdir, mode: 'copy'
 
     input:
 	set file (input_vcf), file (input_vcf_idx) from vcf_recal_ch
@@ -748,8 +755,9 @@ def extractVcfs(tsvFile) {
             def vcf  = returnFile(row[0])
             if (!hasExtension(vcf, ".g.vcf.gz")) exit 1, "File: ${vcf} has the wrong extension. See --help for more information"
             def vcff = row[0]
-            def vcfIdx  = row[0] + ".tbi"
-        [vcff, vcfIdx]
+            //def vcfIdx  = row[0] + ".tbi"
+            def vcfIdx  = returnFile(row[0] + ".tbi")
+        [vcf, vcfIdx]
         }
     
 }

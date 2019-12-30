@@ -18,7 +18,7 @@ def helpMessage() {
 
     The typical command for running the pipeline is as follows:
 
-    nextflow run nf-core/gatkcohortcall --reads '*_R{1,2}.fastq.gz' -profile docker
+    nextflow run nf-core/gatkcohortcall --input xxx.tsv --genome GRCh37 -profile docker
 
     Mandatory arguments:
       --input                       TSV file with one file name per line to be processed
@@ -76,7 +76,9 @@ if (params.genomes && params.genome && !params.genomes.containsKey(params.genome
                                PARAMETERS AND CHANNELS
 ================================================================================
 */
-params.fasta = params.genome[params.genome].fasta 
+print(params.genome)
+
+params.fasta = params.genomes[params.genome].fasta 
 params.dbsnp = params.genomes[params.genome].dbsnp 
 params.dbsnpIndex = params.genomes[params.genome].dbsnpIndex
 params.dict = params.genomes[params.genome].dict
@@ -89,8 +91,8 @@ params.omni  = params.genomes[params.genome].omni
 params.omniIndex  = params.genomes[params.genome].omniIndex
 params.hapmap  = params.genomes[params.genome].hapmap
 params.hapmapIndex  = params.genomes[params.genome].hapmapIndex
-params.1kg          = params.genomes[params.genome].1kg
-params.1kgIndes     = params.genomes[params.genome].1kgIndex 
+params.onekg          = params.genomes[params.genome].onekg
+params.onekgIndex     = params.genomes[params.genome].onekgIndex 
 
 // ExcessHet is a phred-scaled p-value. We want a cutoff of anything more extreme
 // than a z-score of -4.5 which is a p-value of 3.4e-06, which phred-scaled is 54.69
@@ -121,12 +123,15 @@ if (workflow.profile == 'awsbatch') {
 ch_output_docs = Channel.fromPath("${baseDir}/docs/output.md")
 
 tsvPath = null
-if (params.input && (hasExtension(params.input, "tsv")) tsvPath = params.input
+if (params.input && (hasExtension(params.input, "tsv"))) tsvPath = params.input
 
 inputSample = Channel.empty()
 if (tsvPath) {
     tsvFile = file(tsvPath)
     inputSample = extractVcfs(tsvFile)  
+
+    (inputSample, inputSampleSNV, inputSampleSID) = inputSample.into(3)
+
     } else exit 1, 'No sample were defined, see --help'
 
 // Stage config files
@@ -143,7 +148,7 @@ ch_output_docs = file("$baseDir/docs/output.md", checkIfExists: true)
 ch_dbsnp =  Channel.value(file(params.dbsnp))
 ch_fasta =  Channel.value(file(params.fasta))
 ch_fastaFai =  Channel.value(file(params.fastaFai))
-ch_intervals =  Channel.value(file(params.intervals)) 
+//ch_intervals =  Channel.value(file(params.intervals)) 
 
 // knownIndels is currently a list of file for smallGRCh37, so transform it in a channel
 li_knownIndels = []
@@ -278,9 +283,9 @@ process GenotypeGVCFs {
 
     input:
 	set chr, file (workspace) from gendb_ch
-   	file genome from fasta
-    file genomefai from fastafai
-    file genomedict from dict 
+   	file genome from ch_fasta
+    file genomefai from ch_fastaFai
+    file genomedict from params.dict 
 
 	output:
     set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
@@ -388,15 +393,16 @@ process SID_VariantRecalibrator {
 	tag "${params.cohort}"
 
     input:
-	set file (vcf), file (vcfidx) from inputSample
-    file genome from fasta
-    file faidx from fastafai
-    file genomedict from dict
-    file knownIndels_file from knownIndels
-    file knownIndels_idx_file from knownIndelsIndex
-    file axiomPoly_resource_vcf from axiomPoly
-    file dnsnp_resource_vcf from dbsnp
-    file dnsnp_resource_vcf_idx from dbsnpIndex
+	set file(gvcf), file(gvcf_idx) from vcf_sid_ch
+    file genome from params.fasta
+    file faidx from params.fastaFai
+    file genomedict from params.dict
+    file knownIndels_file from params.knownIndels
+    file knownIndels_idx_file from params.knownIndelsIndex
+    //file axiomPoly_resource_vcf from params.axiomPoly
+    //file axiomPoly_resource_vcf_idx from params.axiomPolyIndex
+    file dnsnp_resource_vcf from params.dbsnp
+    file dnsnp_resource_vcf_idx from params.dbsnpIndex
 
 	output:
     set file("${params.cohort}.sid.recal"),file("${params.cohort}.sid.recal.idx"),file("${params.cohort}.sid.tranches") into sid_recal_ch
@@ -433,18 +439,18 @@ process SNV_VariantRecalibrator {
 	tag "${params.cohort}"
 
     input:
-	set file (vcf), file (vcfidx) from vcf_snv_ch
-    file genome from fasta
-    file faidx from fastafai
-    file genomedict from dict
-    file dnsnp_resource_vcf from dbsnp
-    file dnsnp_resource_vcf_idx from dbsnpIndex
-    file hapmap_resource_vcf from hapmap 
-    file hapmap_resource_vcfIndex from hapmapIndex
-    file omni_resource_vcf from omni
-    file omni_resource_vcfIndex from omniIndex
-    file one_thousand_genomes_resource_vcf from 1kg 
-    file one_thousand_genomes_resource_vcfIndex from 1kgIndex
+	set file(gvcf), file(gvcf_idx) from  vcf_snv_ch
+    file genome from params.fasta
+    file faidx from params.fastaFai
+    file genomedict from params.dict
+    file dnsnp_resource_vcf from params.dbsnp
+    file dnsnp_resource_vcf_idx from params.dbsnpIndex
+    file hapmap_resource_vcf from params.hapmap 
+    file hapmap_resource_vcfIndex from params.hapmapIndex
+    file omni_resource_vcf from params.omni
+    file omni_resource_vcfIndex from params.omniIndex
+    file one_thousand_genomes_resource_vcf from params.onekg 
+    file one_thousand_genomes_resource_vcfIndex from params.onekgIndex
 
 	output:
     set file("${params.cohort}.snv.recal"),file("${params.cohort}.snv.recal.idx"),file("${params.cohort}.snv.tranches") into snv_recal_ch
@@ -741,8 +747,20 @@ def extractVcfs(tsvFile) {
         .map { row ->
             def vcf  = returnFile(row[0])
             if (!hasExtension(vcf, ".g.vcf.gz")) exit 1, "File: ${vcf} has the wrong extension. See --help for more information"
+            def vcff = row[0]
+            def vcfIdx  = row[0] + ".tbi"
+        [vcff, vcfIdx]
         }
-        [row[0], row[0]+'.tbi']
-    }
+    
 }
 
+// Check file extension
+def hasExtension(it, extension) {
+    it.toString().toLowerCase().endsWith(extension.toLowerCase())
+}
+
+// Return file if it exists
+def returnFile(it) {
+    if (!file(it).exists()) exit 1, "Missing file in TSV file: ${it}, see --help for more information"
+    return file(it)
+}

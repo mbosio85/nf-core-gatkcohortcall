@@ -21,16 +21,23 @@ def helpMessage() {
     nextflow run nf-core/gatkcohortcall --reads '*_R{1,2}.fastq.gz' -profile docker
 
     Mandatory arguments:
-      --reads                       Path to input data (must be surrounded with quotes)
+      --input                       TSV file with one file name per line to be processed
       -profile                      Configuration profile to use. Can use multiple (comma separated)
                                     Available: conda, docker, singularity, awsbatch, test and more.
 
     Options:
-      --genome                      Name of iGenomes reference
-      --singleEnd                   Specifies that the input is single end reads
+      --genome                      Name of Genomes reference
 
     References                      If not specified in the configuration file or you wish to overwrite any of the references.
-      --fasta                       Path to Fasta reference
+        --dbsnp                     dbsnp file
+        --dbsnpIndex                dbsnp index
+        --dict                      dict from the fasta reference
+        --fasta                     fasta reference
+        --fastafai                  reference index
+        --intervals                 intervals
+        --knownIndels               knownIndels file
+        --knownIndelsIndex          knownIndels index
+        -- and many more that are missing for the moment
 
     Other options:
       --outdir                      The output directory where the results will be saved
@@ -55,118 +62,147 @@ if (params.help) {
  * SET UP CONFIGURATION VARIABLES
  */
 
+// Show help message
+if (params.help) exit 0, helpMessage()
+
 // Check if genome exists in the config file
 if (params.genomes && params.genome && !params.genomes.containsKey(params.genome)) {
     exit 1, "The provided genome '${params.genome}' is not available in the iGenomes file. Currently the available genomes are ${params.genomes.keySet().join(", ")}"
 }
 
-// TODO nf-core: Add any reference files that are needed
-// Configurable reference genomes
-//
-// NOTE - THIS IS NOT USED IN THIS PIPELINE, EXAMPLE ONLY
-// If you want to use the channel below in a process, define the following:
-//   input:
-//   file fasta from ch_fasta
-//
-params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
-if (params.fasta) { ch_fasta = file(params.fasta, checkIfExists: true) }
+
+/*
+================================================================================
+                               PARAMETERS AND CHANNELS
+================================================================================
+*/
+params.fasta = params.genome[params.genome].fasta 
+params.dbsnp = params.genomes[params.genome].dbsnp 
+params.dbsnpIndex = params.genomes[params.genome].dbsnpIndex
+params.dict = params.genomes[params.genome].dict
+params.fastaFai =  params.genomes[params.genome].fastaFai 
+params.knownIndels = params.genomes[params.genome].knownIndels
+params.knownIndelsIndex =params.genomes[params.genome].knownIndelsIndex
+params.axiomPoly  = params.genomes[params.genome].axiomPoly
+params.axiomPolyIndex  = params.genomes[params.genome].axiomPolyIndex
+params.omni  = params.genomes[params.genome].omni
+params.omniIndex  = params.genomes[params.genome].omniIndex
+params.hapmap  = params.genomes[params.genome].hapmap
+params.hapmapIndex  = params.genomes[params.genome].hapmapIndex
+params.1kg          = params.genomes[params.genome].1kg
+params.1kgIndes     = params.genomes[params.genome].1kgIndex 
+
+// ExcessHet is a phred-scaled p-value. We want a cutoff of anything more extreme
+// than a z-score of -4.5 which is a p-value of 3.4e-06, which phred-scaled is 54.69
+excess_het_threshold = 54.69
+
+// Store the chromosomes in a channel for easier workload scattering on large cohort
+chromosomes_ch = Channel
+    .from( "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22", "chrX", "chrY" )
+
+
 
 // Has the run name been specified by the user?
-//  this has the bonus effect of catching both -name and --name
+// This has the bonus effect of catching both -name and --name
 custom_runName = params.name
-if (!(workflow.runName ==~ /[a-z]+_[a-z]+/)) {
-  custom_runName = workflow.runName
-}
+if (!(workflow.runName ==~ /[a-z]+_[a-z]+/)) custom_runName = workflow.runName
 
-if ( workflow.profile == 'awsbatch') {
-  // AWSBatch sanity checking
-  if (!params.awsqueue || !params.awsregion) exit 1, "Specify correct --awsqueue and --awsregion parameters on AWSBatch!"
-  // Check outdir paths to be S3 buckets if running on AWSBatch
-  // related: https://github.com/nextflow-io/nextflow/issues/813
-  if (!params.outdir.startsWith('s3:')) exit 1, "Outdir not on S3 - specify S3 Bucket to run on AWSBatch!"
-  // Prevent trace files to be stored on S3 since S3 does not support rolling files.
-  if (workflow.tracedir.startsWith('s3:')) exit 1, "Specify a local tracedir or run without trace! S3 cannot be used for tracefiles."
+if (workflow.profile == 'awsbatch') {
+    // AWSBatch sanity checking
+    if (!params.awsqueue || !params.awsregion) exit 1, "Specify correct --awsqueue and --awsregion parameters on AWSBatch!"
+    // Check outdir paths to be S3 buckets if running on AWSBatch
+    // related: https://github.com/nextflow-io/nextflow/issues/813
+    if (!params.outdir.startsWith('s3:')) exit 1, "Outdir not on S3 - specify S3 Bucket to run on AWSBatch!"
+    // Prevent trace files to be stored on S3 since S3 does not support rolling files.
+    if (workflow.tracedir.startsWith('s3:')) exit 1, "Specify a local tracedir or run without trace! S3 cannot be used for tracefiles."
 }
 
 // Stage config files
-ch_multiqc_config = file(params.multiqc_config, checkIfExists: true)
+ch_output_docs = Channel.fromPath("${baseDir}/docs/output.md")
+
+tsvPath = null
+if (params.input && (hasExtension(params.input, "tsv")) tsvPath = params.input
+
+inputSample = Channel.empty()
+if (tsvPath) {
+    tsvFile = file(tsvPath)
+    inputSample = extractVcfs(tsvFile)  
+    } else exit 1, 'No sample were defined, see --help'
+
+// Stage config files
 ch_output_docs = file("$baseDir/docs/output.md", checkIfExists: true)
 
+
 /*
- * Create a channel for input read files
- */
-if (params.readPaths) {
-    if (params.singleEnd) {
-        Channel
-            .from(params.readPaths)
-            .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
-            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    } else {
-        Channel
-            .from(params.readPaths)
-            .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true), file(row[1][1], checkIfExists: true) ] ] }
-            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    }
-} else {
-    Channel
-        .fromFilePairs( params.reads, size: params.singleEnd ? 1 : 2 )
-        .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-        .into { read_files_fastqc; read_files_trimming }
-}
+================================================================================
+                               CHECKING REFERENCES
+================================================================================
+*/
+
+// Initialize channels based on params
+ch_dbsnp =  Channel.value(file(params.dbsnp))
+ch_fasta =  Channel.value(file(params.fasta))
+ch_fastaFai =  Channel.value(file(params.fastaFai))
+ch_intervals =  Channel.value(file(params.intervals)) 
+
+// knownIndels is currently a list of file for smallGRCh37, so transform it in a channel
+li_knownIndels = []
+if (params.knownIndels) params.knownIndels.each { li_knownIndels.add(file(it)) }
+ch_knownIndels = params.knownIndels && params.genome == 'smallGRCh37' ? Channel.value(li_knownIndels.collect()) : params.knownIndels ? Channel.value(file(params.knownIndels)) : "null"
+
+
+
+/*
+================================================================================
+                                PRINTING SUMMARY
+================================================================================
+*/
 
 // Header log info
 log.info nfcoreHeader()
 def summary = [:]
-if (workflow.revision) summary['Pipeline Release'] = workflow.revision
-summary['Run Name']         = custom_runName ?: workflow.runName
-// TODO nf-core: Report custom parameters here
-summary['Reads']            = params.reads
-summary['Fasta Ref']        = params.fasta
-summary['Data Type']        = params.singleEnd ? 'Single-End' : 'Paired-End'
-summary['Max Resources']    = "$params.max_memory memory, $params.max_cpus cpus, $params.max_time time per job"
-if (workflow.containerEngine) summary['Container'] = "$workflow.containerEngine - $workflow.container"
-summary['Output dir']       = params.outdir
-summary['Launch dir']       = workflow.launchDir
-summary['Working dir']      = workflow.workDir
-summary['Script dir']       = workflow.projectDir
-summary['User']             = workflow.userName
+if (workflow.revision)          summary['Pipeline Release']    = workflow.revision
+summary['Run Name']          = custom_runName ?: workflow.runName
+summary['Max Resources']     = "${params.max_memory} memory, ${params.max_cpus} cpus, ${params.max_time} time per job"
+if (workflow.containerEngine)   summary['Container']         = "${workflow.containerEngine} - ${workflow.container}"
+if (params.input)               summary['Input']             = params.input
+
+summary['Save Genome Index'] = params.saveGenomeIndex ? 'Yes' : 'No'
+summary['Output dir']        = params.outdir
+summary['Launch dir']        = workflow.launchDir
+summary['Working dir']       = workflow.workDir
+summary['Script dir']        = workflow.projectDir
+summary['User']              = workflow.userName
+summary['genome']            = params.genome
+
+if (params.fasta)                 summary['fasta']                 = params.fasta
+if (params.fastaFai)              summary['fastaFai']              = params.fastaFai
+if (params.dict)                  summary['dict']                  = params.dict
+if (params.bwaIndex)              summary['bwaIndex']              = params.bwaIndex
+if (params.dbsnp)                 summary['dbsnp']                 = params.dbsnp
+if (params.dbsnpIndex)            summary['dbsnpIndex']            = params.dbsnpIndex
+if (params.knownIndels)           summary['knownIndels']           = params.knownIndels
+if (params.knownIndelsIndex)      summary['knownIndelsIndex']      = params.knownIndelsIndex
+
+
 if (workflow.profile == 'awsbatch') {
-  summary['AWS Region']     = params.awsregion
-  summary['AWS Queue']      = params.awsqueue
+    summary['AWS Region']        = params.awsregion
+    summary['AWS Queue']         = params.awsqueue
 }
 summary['Config Profile'] = workflow.profile
-if (params.config_profile_description) summary['Config Description'] = params.config_profile_description
-if (params.config_profile_contact)     summary['Config Contact']     = params.config_profile_contact
-if (params.config_profile_url)         summary['Config URL']         = params.config_profile_url
-if (params.email || params.email_on_fail) {
-  summary['E-mail Address']    = params.email
-  summary['E-mail on failure'] = params.email_on_fail
-  summary['MultiQC maxsize']   = params.maxMultiqcEmailFileSize
+if (params.config_profile_description)  summary['Config Description']  = params.config_profile_description
+if (params.config_profile_contact)      summary['Config Contact']      = params.config_profile_contact
+if (params.config_profile_url)          summary['Config URL']          = params.config_profile_url
+if (params.email) {
+    summary['E-mail Address']        = params.email
+    summary['MultiQC maxsize']       = params.maxMultiqcEmailFileSize
 }
-log.info summary.collect { k,v -> "${k.padRight(18)}: $v" }.join("\n")
-log.info "-\033[2m--------------------------------------------------\033[0m-"
+log.info summary.collect { k, v -> "${k.padRight(18)}: $v" }.join("\n")
+if (params.monochrome_logs) log.info "----------------------------------------------------"
+else log.info "\033[2m----------------------------------------------------\033[0m"
 
 // Check the hostnames against configured profiles
 checkHostname()
-
-def create_workflow_summary(summary) {
-    def yaml_file = workDir.resolve('workflow_summary_mqc.yaml')
-    yaml_file.text  = """
-    id: 'nf-core-gatkcohortcall-summary'
-    description: " - this information is collected when the pipeline is started."
-    section_name: 'nf-core/gatkcohortcall Workflow Summary'
-    section_href: 'https://github.com/nf-core/gatkcohortcall'
-    plot_type: 'html'
-    data: |
-        <dl class=\"dl-horizontal\">
-${summary.collect { k,v -> "            <dt>$k</dt><dd><samp>${v ?: '<span style=\"color:#999999;\">N/A</a>'}</samp></dd>" }.join("\n")}
-        </dl>
-    """.stripIndent()
-
-   return yaml_file
-}
 
 /*
  * Parse software version numbers
@@ -193,53 +229,299 @@ process get_software_versions {
     """
 }
 
-/*
- * STEP 1 - FastQC
- */
-process fastqc {
-    tag "$name"
-    label 'process_medium'
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: { filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename" }
+//
+// Process launching GenomicsDBImport to gather all VCFs, per chromosome
+//
+process GenomicsDBImport {
+
+	label 'memory_max'
+    label 'cpus_1'
+
+    errorStrategy 'retry'
+    maxRetries 3
+
+	tag { chr }
 
     input:
-    set val(name), file(reads) from read_files_fastqc
+	each chr from chromosomes_ch
+    set file(gvcf), file(gvcf_idx) from inputSample.collect()
 
-    output:
-    file "*_fastqc.{zip,html}" into fastqc_results
-
+	output:
+    set chr, file ("${params.cohort}.${chr}") into gendb_ch
+	
     script:
-    """
-    fastqc --quiet --threads $task.cpus $reads
-    """
-}
+	"""
+	gatk GenomicsDBImport --java-options -Xmx${task.memory.toGiga()}g \
+	${gvcf.collect { "-V $it " }.join()} \
+    -L ${chr} \
+    --batch-size 50 \
+    --tmp-dir=/tmp \
+	--genomicsdb-workspace-path ${params.cohort}.${chr}
+	
+	"""
+}	
 
-/*
- * STEP 2 - MultiQC
- */
-process multiqc {
-    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+
+
+
+//
+// Process launching GenotypeGVCFs on the previously created genDB, per chromosome
+//
+process GenotypeGVCFs {
+    
+    label 'memory_singleCPU_2_task'
+    label 'cpus_4'
+	
+	tag { chr }
+
+	publishDir params.output_dir, mode: 'copy', pattern: '*.{vcf,idx}'
 
     input:
-    file multiqc_config from ch_multiqc_config
-    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
-    file ('software_versions/*') from software_versions_yaml.collect()
-    file workflow_summary from create_workflow_summary(summary)
+	set chr, file (workspace) from gendb_ch
+   	file genome from fasta
+    file genomefai from fastafai
+    file genomedict from dict 
 
-    output:
-    file "*multiqc_report.html" into multiqc_report
-    file "*_data"
-    file "multiqc_plots"
+	output:
+    set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
+    
+    script:
+	"""
+
+    WORKSPACE=\$( basename ${workspace} )
+
+    gatk --java-options -Xmx${task.memory.toGiga()}g  \
+     GenotypeGVCFs \
+     -R ${genome} \
+     -O ${params.cohort}.${chr}.vcf \
+     -D ${dbsnp_resource_vcf} \
+     -G StandardAnnotation \
+     --only-output-calls-starting-in-intervals \
+     --use-new-qual-calculator \
+     -V gendb://\$WORKSPACE \
+     -L ${chr}
+
+	"""
+}	
+
+
+//
+// Process Hard Filtering on ExcessHet, per chromosome
+//
+process HardFilter {
+
+    label 'memory_singleCPU_2_task'
+    label 'cpus_1'
+	
+	tag { chr }
+
+    input:
+	set chr, file (vcf), file (vcfidx) from vcf_ch
+
+	output:
+    file("${params.cohort}.${chr}.filtered.vcf") into (vcf_hf_ch)
+    file("${params.cohort}.${chr}.filtered.vcf.idx") into (vcf_idx_hf_ch)
 
     script:
-    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
-    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
-    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
-    """
-    multiqc -f $rtitle $rfilename --config $multiqc_config .
-    """
-}
+	"""
+	gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      VariantFiltration \
+      --filter-expression "ExcessHet > ${excess_het_threshold}" \
+      --filter-name ExcessHet \
+      -V ${vcf} \
+      -O ${params.cohort}.${chr}.markfiltered.vcf
+
+	gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      SelectVariants \
+      --exclude-filtered \
+      -V ${params.cohort}.${chr}.markfiltered.vcf \
+      -O ${params.cohort}.${chr}.filtered.vcf
+
+	"""
+}	
+
+
+
+process GatherVcfs {
+
+	label 'memory_singleCPU_2_task'
+    label 'cpus_1'
+	
+	tag "${params.cohort}"
+
+    input:
+    file (vcf) from vcf_hf_ch.collect()
+	file (vcf_idx) from vcf_idx_hf_ch.collect()
+
+	output:
+    set file("${params.cohort}.vcf"), file("${params.cohort}.vcf.idx") into (vcf_snv_ch, vcf_sid_ch, vcf_recal_ch)
+
+    // WARNING : complicated channel extraction! 
+    // GATK GatherVcfs only accepts as input VCF in the chromosomical order. Nextflow/Groovy list are not sorted. The following command does :
+    // 1 : look for all VCF with "chr[0-9]*" in the filename (\d+ means 1 or + digits)
+    // 2 : Tokenize the filenames with "." as the separator, keep the 2nd item (indexed [1]) "chr[0-9]*"
+    // 3 : Take from the 3rd character till the end of the string "chr[0-9]*", ie the chromosome number
+    // 4 : Cast it from a string to an integer (to force a numerical sort)
+    // 5 : Sort 
+    // 6 : Add chrX and chrY to the list
+
+    script:
+	"""
+	gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      GatherVcfs \
+      ${vcf.findAll{ it=~/chr\d+/ }.collect().sort{ it.name.tokenize('.')[1].substring(3).toInteger() }.plus(vcf.find{ it=~/chrX/ }).plus(vcf.find{ it=~/chrY/ }).collect{ "--INPUT $it " }.join() } \
+      --OUTPUT ${params.cohort}.vcf
+
+	"""
+}	
+
+
+
+//
+// Process SID recalibration
+//
+process SID_VariantRecalibrator {
+
+	label 'memory_max'
+    label 'cpus_1'
+	
+	tag "${params.cohort}"
+
+    input:
+	set file (vcf), file (vcfidx) from inputSample
+    file genome from fasta
+    file faidx from fastafai
+    file genomedict from dict
+    file knownIndels_file from knownIndels
+    file knownIndels_idx_file from knownIndelsIndex
+    file axiomPoly_resource_vcf from axiomPoly
+    file dnsnp_resource_vcf from dbsnp
+    file dnsnp_resource_vcf_idx from dbsnpIndex
+
+	output:
+    set file("${params.cohort}.sid.recal"),file("${params.cohort}.sid.recal.idx"),file("${params.cohort}.sid.tranches") into sid_recal_ch
+
+    script:
+	"""
+    gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      VariantRecalibrator \
+      -R ${genome} \
+      -V ${vcf} \
+      --output ${params.cohort}.sid.recal \
+      --tranches-file ${params.cohort}.sid.tranches \
+      --trust-all-polymorphic \
+      -an QD -an DP -an FS -an SOR -an ReadPosRankSum -an MQRankSum -an InbreedingCoeff \
+      -mode INDEL \
+      --max-gaussians 4 \
+      -resource mills,known=false,training=true,truth=true,prior=12:${knownIndels_file} \
+      -resource dbsnp,known=true,training=false,truth=false,prior=2:${dbsnp_resource_vcf} \
+      # -resource axiomPoly,known=false,training=true,truth=false,prior=10:${axiomPoly_resource_vcf} \
+	
+	"""
+}	
+
+
+
+//
+// Process SNV recalibration
+//
+process SNV_VariantRecalibrator {
+
+	label 'memory_max'
+    label 'cpus_1'
+	
+	tag "${params.cohort}"
+
+    input:
+	set file (vcf), file (vcfidx) from vcf_snv_ch
+    file genome from fasta
+    file faidx from fastafai
+    file genomedict from dict
+    file dnsnp_resource_vcf from dbsnp
+    file dnsnp_resource_vcf_idx from dbsnpIndex
+    file hapmap_resource_vcf from hapmap 
+    file hapmap_resource_vcfIndex from hapmapIndex
+    file omni_resource_vcf from omni
+    file omni_resource_vcfIndex from omniIndex
+    file one_thousand_genomes_resource_vcf from 1kg 
+    file one_thousand_genomes_resource_vcfIndex from 1kgIndex
+
+	output:
+    set file("${params.cohort}.snv.recal"),file("${params.cohort}.snv.recal.idx"),file("${params.cohort}.snv.tranches") into snv_recal_ch
+
+    script:
+	"""
+    gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      VariantRecalibrator \
+      -R ${genome} \
+      -V ${vcf} \
+      --output ${params.cohort}.snv.recal \
+      --tranches-file ${params.cohort}.snv.tranches \
+      --trust-all-polymorphic \
+      -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR -an DP -an InbreedingCoeff \
+      -mode SNP \
+      --max-gaussians 6 \
+      -resource hapmap,known=false,training=true,truth=true,prior=15:${hapmap_resource_vcf} \
+      -resource omni,known=false,training=true,truth=true,prior=12:${omni_resource_vcf} \
+      -resource 1000G,known=false,training=true,truth=false,prior=10:${one_thousand_genomes_resource_vcf} \
+      -resource dbsnp,known=true,training=false,truth=false,prior=7:${dbsnp_resource_vcf}
+	
+	"""
+}	
+
+
+
+//
+// Process Apply SNV and SID recalibrations
+//
+process ApplyRecalibration {
+
+	label 'memory_max'
+    label 'cpus_1'
+	
+	tag "${params.cohort}"
+
+	publishDir params.output_dir, mode: 'copy'
+
+    input:
+	set file (input_vcf), file (input_vcf_idx) from vcf_recal_ch
+	set file (indels_recalibration), file (indels_recalibration_idx), file (indels_tranches) from sid_recal_ch
+	set file (snps_recalibration), file (snps_recalibration_idx), file (snps_tranches) from snv_recal_ch
+
+	output:
+    set file("${params.cohort}.recalibrated.vcf"),file("${params.cohort}.recalibrated.vcf.idx") into vcf_final_ch
+
+    script:
+	"""
+    gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      ApplyVQSR \
+      -O tmp.indel.recalibrated.vcf \
+      -V ${input_vcf} \
+      --recal-file ${indels_recalibration} \
+      --tranches-file ${indels_tranches} \
+      --truth-sensitivity-filter-level 99.0 \
+      --exclude-filtered \
+      --create-output-variant-index true \
+      -mode INDEL
+
+    gatk --java-options -Xmx${task.memory.toGiga()}g  \
+      ApplyVQSR \
+      -O ${params.cohort}.recalibrated.vcf \
+      -V tmp.indel.recalibrated.vcf \
+      --recal-file ${snps_recalibration} \
+      --tranches-file ${snps_tranches} \
+      --truth-sensitivity-filter-level 99.5 \
+      --exclude-filtered \
+      --create-output-variant-index true \
+      -mode SNP
+		
+	"""
+}	
+
+
+
+
+
 
 /*
  * STEP 3 - Output Description HTML
@@ -376,6 +658,30 @@ workflow.onComplete {
 }
 
 
+
+/*
+================================================================================
+                                nf-core functions
+================================================================================
+*/
+def create_workflow_summary(summary) {
+    def yaml_file = workDir.resolve('workflow_summary_mqc.yaml')
+    yaml_file.text  = """
+    id: 'nf-core-gatkcohortcall-summary'
+    description: " - this information is collected when the pipeline is started."
+    section_name: 'nf-core/gatkcohortcall Workflow Summary'
+    section_href: 'https://github.com/nf-core/gatkcohortcall'
+    plot_type: 'html'
+    data: |
+        <dl class=\"dl-horizontal\">
+${summary.collect { k,v -> "            <dt>$k</dt><dd><samp>${v ?: '<span style=\"color:#999999;\">N/A</a>'}</samp></dd>" }.join("\n")}
+        </dl>
+    """.stripIndent()
+
+   return yaml_file
+}
+
+
 def nfcoreHeader(){
     // Log colors ANSI codes
     c_reset = params.monochrome_logs ? '' : "\033[0m";
@@ -419,3 +725,24 @@ def checkHostname(){
         }
     }
 }
+
+
+/*
+================================================================================
+                                pipeline functions
+================================================================================
+*/
+// Create a channel of germline g.vcfs from a list of files to be processed
+
+def extractVcfs(tsvFile) {
+    // Reads line by line and returns lists of VCF path , VCF.tbi path 
+    Channel.from(tsvFile)
+        .splitCsv(sep: '\t')
+        .map { row ->
+            def vcf  = returnFile(row[0])
+            if (!hasExtension(vcf, ".g.vcf.gz")) exit 1, "File: ${vcf} has the wrong extension. See --help for more information"
+        }
+        [row[0], row[0]+'.tbi']
+    }
+}
+

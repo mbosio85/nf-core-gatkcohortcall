@@ -93,7 +93,8 @@ params.hapmap  = params.genomes[params.genome].hapmap
 params.hapmapIndex  = params.genomes[params.genome].hapmapIndex
 params.onekg          = params.genomes[params.genome].onekg
 params.onekgIndex     = params.genomes[params.genome].onekgIndex 
-
+params.mills          = params.genomes[params.genome].mills
+params.millsIndex     = params.genomes[params.genome].millsIndex 
 // ExcessHet is a phred-scaled p-value. We want a cutoff of anything more extreme
 // than a z-score of -4.5 which is a p-value of 3.4e-06, which phred-scaled is 54.69
 excess_het_threshold = 54.69
@@ -133,9 +134,8 @@ if (params.input && (hasExtension(params.input, "tsv"))) tsvPath = params.input
 inputSample = Channel.empty()
 if (tsvPath) {
     tsvFile = file(tsvPath)
-    inputSample = extractVcfs(tsvFile)  
-
-    (inputSample, inputSampleSNV, inputSampleSID) = inputSample.into(3)
+    gvcf_ch = extractVcfs(tsvFile)  
+    gvcf_idx_ch = extractVcfsIndex(tsvFile)  
 
     } else exit 1, 'No sample were defined, see --help'
 
@@ -254,10 +254,11 @@ process GenomicsDBImport {
 
     input:
 	each chr from chromosomes_ch
-    set file(gvcf), file(gvcf_idx) from inputSample
+    file(gvcf) from gvcf_ch.collect()
+    file(gvcf_idx) from gvcf_idx_ch.collect()
 
 	output:
-    set chr, file ("${params.cohort}.${chr}") into gendb_ch
+    tuple chr, file ("${params.cohort}.${chr}") into gendb_ch
 	
     script:
 	"""
@@ -283,19 +284,19 @@ process GenotypeGVCFs {
     label 'cpus_4'
 	
 	tag { chr }
-
-	publishDir params.outdir, mode: 'copy', pattern: '*.{vcf,idx}'
+    //publishDir path:"${params.outdir}/Genotyping/", mode: params.publishDirMode, pattern: '*.{vcf,idx}'
+	
 
     input:
-	set chr, file (workspace) from gendb_ch
+	tuple chr, file (workspace) from gendb_ch
    	file genome from ch_fasta
     file genomefai from ch_fastaFai
-    file genomedict from params.dict 
-    file dbsnp_resource_vcf from params.dbsnp
-    file dbsnp_resource_vcf_idx from params.dbsnpIndex
+    file genomedict from Channel.value(file(params.dict ))
+    file dbsnp_resource_vcf from Channel.value(file(params.dbsnp ))
+    file dbsnp_resource_vcf_idx from Channel.value(file(params.dbsnpIndex ))
 
 	output:
-    set chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
+    tuple chr, file("${params.cohort}.${chr}.vcf"), file("${params.cohort}.${chr}.vcf.idx") into vcf_ch
     
     script:
 	"""
@@ -328,7 +329,7 @@ process HardFilter {
 	tag { chr }
 
     input:
-	set chr, file (vcf), file (vcfidx) from vcf_ch
+	tuple chr, file (vcf), file (vcfidx) from vcf_ch
 
 	output:
     file("${params.cohort}.${chr}.filtered.vcf") into (vcf_hf_ch)
@@ -361,12 +362,15 @@ process GatherVcfs {
 	
 	tag "${params.cohort}"
 
+    publishDir path:"${params.outdir}/CohortGenotype/", mode: params.publishDirMode, pattern: '*.{vcf,idx}'
+
     input:
     file (vcf) from vcf_hf_ch.collect()
 	file (vcf_idx) from vcf_idx_hf_ch.collect()
+    val genome from params.genome
 
 	output:
-    set file("${params.cohort}.vcf"), file("${params.cohort}.vcf.idx") into (vcf_snv_ch, vcf_sid_ch, vcf_recal_ch)
+    tuple file("${params.cohort}.vcf"), file("${params.cohort}.vcf.idx") into (vcf_snv_ch, vcf_sid_ch, vcf_recal_ch)
 
     // WARNING : complicated channel extraction! 
     // GATK GatherVcfs only accepts as input VCF in the chromosomical order. Nextflow/Groovy list are not sorted. The following command does :
@@ -378,13 +382,22 @@ process GatherVcfs {
     // 6 : Add chrX and chrY to the list
 
     script:
-	"""
-	gatk --java-options -Xmx${task.memory.toGiga()}g  \
-      GatherVcfs \
-      ${vcf.findAll{ it=~/chr\d+/ }.collect().sort{ it.name.tokenize('.')[1].substring(3).toInteger() }.plus(vcf.find{ it=~/chrX/ }).plus(vcf.find{ it=~/chrY/ }).collect{ "--INPUT $it " }.join() } \
-      --OUTPUT ${params.cohort}.vcf
 
-	"""
+    if( genome == 'GRCh38' )
+      	"""
+     	gatk --java-options -Xmx${task.memory.toGiga()}g  \
+        GatherVcfs \
+           ${vcf.findAll{ it=~/chr\d+/ }.collect().sort{ it.name.tokenize('.')[1].substring(3).toInteger() }.plus(vcf.find{ it=~/chrX/ }).plus(vcf.find{ it=~/chrY/ }).minus(null).collect{ "--INPUT $it " }.join() } \
+        --OUTPUT ${params.cohort}.vcf
+        """
+    else
+      """
+       gatk --java-options -Xmx${task.memory.toGiga()}g  \
+        GatherVcfs \
+           ${vcf.findAll{ it=~/\d+/ }.collect().sort{ it.name.tokenize('.')[1].toInteger() }.plus(vcf.find{ it=~/X/ }).plus(vcf.find{ it=~/Y/ }).minus(null).collect{ "--INPUT $it " }.join() }\
+        --OUTPUT ${params.cohort}.vcf
+       """ 
+	
 }	
 
 
@@ -400,36 +413,37 @@ process SID_VariantRecalibrator {
 	tag "${params.cohort}"
 
     input:
-	set file(gvcf), file(gvcf_idx) from vcf_sid_ch
-    file genome from params.fasta
-    file faidx from params.fastaFai
-    file genomedict from params.dict
-    file knownIndels_file from params.knownIndels
-    file knownIndels_idx_file from params.knownIndelsIndex
-    //file axiomPoly_resource_vcf from params.axiomPoly
-    //file axiomPoly_resource_vcf_idx from params.axiomPolyIndex
-    file dnsnp_resource_vcf from params.dbsnp
-    file dnsnp_resource_vcf_idx from params.dbsnpIndex
+	tuple file(gvcf), file(gvcf_idx) from vcf_sid_ch
+    file genome from ch_fasta
+    file genomefai from ch_fastaFai
+    file genomedict from Channel.value(file(params.dict ))
+    file dbsnp_resource_vcf from Channel.value(file(params.dbsnp ))
+    file dbsnp_resource_vcf_idx from Channel.value(file(params.dbsnpIndex ))
+    file knownIndels_file from Channel.value(file(params.mills ))
+    file knownIndels_idx_file from Channel.value(file(params.millsIndex ))
+    file axiomPoly_resource_vcf from Channel.value(file(params.axiomPoly ))
+    //file axiomPoly_resource_vcf_idx Channel.value(file(params.axiomPolyIndex ))
+    
 
 	output:
-    set file("${params.cohort}.sid.recal"),file("${params.cohort}.sid.recal.idx"),file("${params.cohort}.sid.tranches") into sid_recal_ch
+    tuple file("${params.cohort}.sid.recal"),file("${params.cohort}.sid.recal.idx"),file("${params.cohort}.sid.tranches") into sid_recal_ch
 
     script:
 	"""
     gatk --java-options -Xmx${task.memory.toGiga()}g  \
       VariantRecalibrator \
       -R ${genome} \
-      -V ${vcf} \
+      -V ${gvcf} \
       --output ${params.cohort}.sid.recal \
       --tranches-file ${params.cohort}.sid.tranches \
       --trust-all-polymorphic \
-      -an QD -an DP -an FS -an SOR -an ReadPosRankSum -an MQRankSum -an InbreedingCoeff \
+      -an QD -an DP -an FS -an SOR -an ReadPosRankSum -an MQRankSum  \
       -mode INDEL \
       --max-gaussians 4 \
-      -resource mills,known=false,training=true,truth=true,prior=12:${knownIndels_file} \
-      -resource dbsnp,known=true,training=false,truth=false,prior=2:${dbsnp_resource_vcf} \
-      # -resource axiomPoly,known=false,training=true,truth=false,prior=10:${axiomPoly_resource_vcf} \
-	
+      --resource:mills,known=false,training=true,truth=true,prior=12 ${knownIndels_file} \
+      --resource:dbsnp,known=true,training=false,truth=false,prior=2 ${dbsnp_resource_vcf} \
+      # --resource:axiomPoly,known=false,training=true,truth=false,prior=10 ${axiomPoly_resource_vcf} \
+	  # Can add "-an InbreedingCoeff" if more than 10 samples
 	"""
 }	
 
@@ -446,39 +460,42 @@ process SNV_VariantRecalibrator {
 	tag "${params.cohort}"
 
     input:
-	set file(gvcf), file(gvcf_idx) from  vcf_snv_ch
-    file genome from params.fasta
-    file faidx from params.fastaFai
-    file genomedict from params.dict
-    file dnsnp_resource_vcf from params.dbsnp
-    file dnsnp_resource_vcf_idx from params.dbsnpIndex
-    file hapmap_resource_vcf from params.hapmap 
-    file hapmap_resource_vcfIndex from params.hapmapIndex
-    file omni_resource_vcf from params.omni
-    file omni_resource_vcfIndex from params.omniIndex
-    file one_thousand_genomes_resource_vcf from params.onekg 
-    file one_thousand_genomes_resource_vcfIndex from params.onekgIndex
+	tuple file(gvcf), file(gvcf_idx) from  vcf_snv_ch
+    file genome from ch_fasta
+    file genomefai from ch_fastaFai
+    file genomedict from Channel.value(file(params.dict ))
+    file dbsnp_resource_vcf from Channel.value(file(params.dbsnp ))
+    file dbsnp_resource_vcf_idx from Channel.value(file(params.dbsnpIndex ))
+    file hapmap_resource_vcf from Channel.value(file(params.hapmap ))
+    file hapmap_resource_vcfIndex from Channel.value(file(params.hapmapIndex ))
+    file omni_resource_vcf from Channel.value(file(params.omni))
+    file omni_resource_vcfIndex from Channel.value(file(params.omniIndex))
+    file one_thousand_genomes_resource_vcf from Channel.value(file(params.onekg))
+    file one_thousand_genomes_resource_vcfIndex from Channel.value(file(params.onekgIndex))
+
+
 
 	output:
-    set file("${params.cohort}.snv.recal"),file("${params.cohort}.snv.recal.idx"),file("${params.cohort}.snv.tranches") into snv_recal_ch
+    tuple file("${params.cohort}.snv.recal"),file("${params.cohort}.snv.recal.idx"),file("${params.cohort}.snv.tranches") into snv_recal_ch
 
     script:
 	"""
     gatk --java-options -Xmx${task.memory.toGiga()}g  \
       VariantRecalibrator \
       -R ${genome} \
-      -V ${vcf} \
+      -V ${gvcf} \
       --output ${params.cohort}.snv.recal \
       --tranches-file ${params.cohort}.snv.tranches \
       --trust-all-polymorphic \
-      -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR -an DP -an InbreedingCoeff \
+      -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR -an DP  \
       -mode SNP \
       --max-gaussians 6 \
-      -resource hapmap,known=false,training=true,truth=true,prior=15:${hapmap_resource_vcf} \
-      -resource omni,known=false,training=true,truth=true,prior=12:${omni_resource_vcf} \
-      -resource 1000G,known=false,training=true,truth=false,prior=10:${one_thousand_genomes_resource_vcf} \
-      -resource dbsnp,known=true,training=false,truth=false,prior=7:${dbsnp_resource_vcf}
+      --resource:hapmap,known=false,training=true,truth=true,prior=15 ${hapmap_resource_vcf} \
+      --resource:omni,known=false,training=true,truth=true,prior=12 ${omni_resource_vcf} \
+      --resource:1000G,known=false,training=true,truth=false,prior=10 ${one_thousand_genomes_resource_vcf} \
+      --resource:dbsnp,known=true,training=false,truth=false,prior=7 ${dbsnp_resource_vcf}
 	
+     # Can add "-an InbreedingCoeff" if more than 10 samples
 	"""
 }	
 
@@ -494,15 +511,15 @@ process ApplyRecalibration {
 	
 	tag "${params.cohort}"
 
-	publishDir params.outdir, mode: 'copy'
+	publishDir path:"${params.outdir}/VariantRecalibration/", mode: params.publishDirMode, pattern: '*.{vcf,idx}'
 
     input:
-	set file (input_vcf), file (input_vcf_idx) from vcf_recal_ch
-	set file (indels_recalibration), file (indels_recalibration_idx), file (indels_tranches) from sid_recal_ch
-	set file (snps_recalibration), file (snps_recalibration_idx), file (snps_tranches) from snv_recal_ch
+	tuple file (input_vcf), file (input_vcf_idx) from vcf_recal_ch
+	tuple file (indels_recalibration), file (indels_recalibration_idx), file (indels_tranches) from sid_recal_ch
+	tuple file (snps_recalibration), file (snps_recalibration_idx), file (snps_tranches) from snv_recal_ch
 
 	output:
-    set file("${params.cohort}.recalibrated.vcf"),file("${params.cohort}.recalibrated.vcf.idx") into vcf_final_ch
+    tuple file("${params.cohort}.recalibrated.vcf"),file("${params.cohort}.recalibrated.vcf.idx") into vcf_final_ch
 
     script:
 	"""
@@ -754,10 +771,20 @@ def extractVcfs(tsvFile) {
         .map { row ->
             def vcf  = returnFile(row[0])
             if (!hasExtension(vcf, ".g.vcf.gz")) exit 1, "File: ${vcf} has the wrong extension. See --help for more information"
-            def vcff = row[0]
-            //def vcfIdx  = row[0] + ".tbi"
             def vcfIdx  = returnFile(row[0] + ".tbi")
-        [vcf, vcfIdx]
+        vcf
+        }
+    
+}
+def extractVcfsIndex(tsvFile) {
+    // Reads line by line and returns lists of VCF path , VCF.tbi path 
+    Channel.from(tsvFile)
+        .splitCsv(sep: '\t')
+        .map { row ->
+            def vcf  = returnFile(row[0])
+            if (!hasExtension(vcf, ".g.vcf.gz")) exit 1, "File: ${vcf} has the wrong extension. See --help for more information"
+            def vcfIdx  = returnFile(row[0] + ".tbi")
+         vcfIdx
         }
     
 }

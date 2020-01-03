@@ -6,7 +6,7 @@
 [![Nextflow](https://img.shields.io/badge/nextflow-%E2%89%A50.32.0-brightgreen.svg)](https://www.nextflow.io/)
 
 [![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg)](http://bioconda.github.io/)
-[![Docker](https://img.shields.io/docker/automated/nfcore/gatkcohortcall.svg)](https://hub.docker.com/r/mbosio85/nf-core-gatkcohortcall)
+[![Docker](https://img.shields.io/docker/automated/mbosio85/nf-core-gatkcohortcall.svg)](https://hub.docker.com/r/mbosio85/nf-core-gatkcohortcall)
 
 ## Introduction
 
